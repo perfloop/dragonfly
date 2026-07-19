@@ -246,6 +246,11 @@ template <typename dist_t> class HierarchicalNSW : public hnswlib::AlgorithmInte
     return num_deleted_;
   }
 
+  size_t getReusableDeletedCount() {
+    std::unique_lock<std::mutex> lock_deleted_elements(deleted_elements_lock);
+    return deleted_elements.size();
+  }
+
   std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>,
                       CompareByFirst>
   searchBaseLayer(tableint ep_id, const void* data_point, int layer) {
@@ -958,13 +963,13 @@ template <typename dist_t> class HierarchicalNSW : public hnswlib::AlgorithmInte
    * whereas maxM0_ has to be limited to the lower 16 bits, however, still large enough in almost
    * all cases.
    */
-  bool markDeletedInternal(tableint internalId) {
+  bool markDeletedInternal(tableint internalId, bool make_reusable = true) {
     assert(internalId < cur_element_count);
     if (!isMarkedDeleted(internalId)) {
       unsigned char* ll_cur = ((unsigned char*)get_linklist0(internalId)) + 2;
       *ll_cur |= DELETE_MARK;
       num_deleted_ += 1;
-      if (allow_replace_deleted_) {
+      if (allow_replace_deleted_ && make_reusable) {
         std::unique_lock<std::mutex> lock_deleted_elements(deleted_elements_lock);
         deleted_elements.insert(internalId);
       }
@@ -1029,17 +1034,18 @@ template <typename dist_t> class HierarchicalNSW : public hnswlib::AlgorithmInte
     *((unsigned short int*)(ptr)) = *((unsigned short int*)&size);
   }
 
-  // Reuses a deleted slot only after resolving the incoming label.  The upstream
+  // Reuses a deleted slot only after resolving the incoming label. The upstream
   // addPoint(..., true) removes an arbitrary tombstone before checking whether
   // label already names a deleted node, which can make a same-label reactivation
-  // consume another label's slot.  This path is used by Dragonfly's serialized
-  // adapter mutations, so a replaced deleted node cannot be concurrently used.
+  // consume another label's slot.
   void addPointWithDeletedSlotReuse(const void* data_point, labeltype label) {
-    if (!allow_replace_deleted_) {
-      throw std::runtime_error("Replacement of deleted elements is disabled in constructor");
+    // Preserve the ordinary add/update path when no node is deleted. This avoids
+    // an extra label-map lookup on initial ingestion.
+    if (getDeletedCount() == 0) {
+      addPoint(data_point, label);
+      return;
     }
 
-    std::unique_lock<std::mutex> lock_label(getLabelOpMutex(label));
     tableint existing_internal_id = 0;
     bool has_existing_label = false;
     {
@@ -1070,14 +1076,10 @@ template <typename dist_t> class HierarchicalNSW : public hnswlib::AlgorithmInte
       }
     }
     if (!has_deleted_slot) {
-      // This overload does not take the label-operation lock itself.
-      addPoint(data_point, label, -1);
+      addPoint(data_point, label);
       return;
     }
 
-    // Match the existing replacement flow for an absent label.  The adapter's
-    // write lock serializes mutation of the removed label while its tombstone is
-    // being repurposed.
     labeltype label_replaced = getExternalLabel(internal_id_replaced);
     setExternalLabel(internal_id_replaced, label);
     {

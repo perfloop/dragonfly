@@ -81,11 +81,13 @@ struct HnswlibAdapter {
 
   void Add(const void* data, GlobalDocId id) {
     MRMWMutexLock lock(&mrmw_mutex_, MRMWMutex::LockMode::kWriteLock);
+    absl::MutexLock mutation_lock(&mutation_mutex_);
     DoAdd(data, id);
   }
 
   void Remove(GlobalDocId id) {
     MRMWMutexLock lock(&mrmw_mutex_, MRMWMutex::LockMode::kWriteLock);
+    absl::MutexLock mutation_lock(&mutation_mutex_);
     DoRemove(id);
   }
 
@@ -240,7 +242,7 @@ struct HnswlibAdapter {
       // First check with reader lock to avoid contention.
       absl::ReaderMutexLock lock(&resize_mutex_);
       if (world_.getCurrentElementCount() < world_.getMaxElements() ||
-          (world_.allow_replace_deleted_ && world_.getDeletedCount() > 0)) {
+          world_.getReusableDeletedCount() > 0) {
         return;
       }
     }
@@ -248,7 +250,7 @@ struct HnswlibAdapter {
       // Upgrade to writer lock.
       absl::WriterMutexLock lock(&resize_mutex_);
       if (world_.getCurrentElementCount() == world_.getMaxElements() &&
-          (!world_.allow_replace_deleted_ || world_.getDeletedCount() == 0)) {
+          world_.getReusableDeletedCount() == 0) {
         auto max_elements = world_.getMaxElements();
         world_.resizeIndex(max_elements * 2);
         VLOG(1) << "Resizing HNSW Index from " << max_elements << " to " << max_elements * 2;
@@ -274,6 +276,7 @@ struct HnswlibAdapter {
   // caller should fall back to rebuilding the index from the keyspace.
   bool RestoreFromNodes(const std::vector<HnswNodeData>& nodes, const HnswIndexMetadata& metadata) {
     MRMWMutexLock lock(&mrmw_mutex_, MRMWMutex::LockMode::kWriteLock);
+    absl::MutexLock mutation_lock(&mutation_mutex_);
     absl::WriterMutexLock resize_lock(&resize_mutex_);
 
     if (nodes.empty()) {
@@ -371,7 +374,8 @@ struct HnswlibAdapter {
       world_.cur_element_count.store(++restored_count);
 
       // Mark node as deleted until UpdateVectorData provides valid vector data.
-      world_.markDeletedInternal(internal_id);
+      // It must not be reused before that materialization completes.
+      world_.markDeletedInternal(internal_id, /*make_reusable=*/false);
 
       // In borrowed mode, deleted nodes are still traversed by addPoint.
       // Point to stub_vector_ so distance computations don't dereference nullptr.
@@ -396,6 +400,7 @@ struct HnswlibAdapter {
   // Returns false if the node doesn't exist in the index.
   bool UpdateVectorData(GlobalDocId id, const void* data) {
     MRMWMutexLock lock(&mrmw_mutex_, MRMWMutex::LockMode::kWriteLock);
+    absl::MutexLock mutation_lock(&mutation_mutex_);
 
     // Find the internal id for this label
     auto it = world_.label_lookup_.find(id);
@@ -438,6 +443,9 @@ struct HnswlibAdapter {
   HnswSpace space_;
   HierarchicalNSW<float> world_;
   absl::Mutex resize_mutex_;
+  // MRMWMutex permits concurrent writers; serialize all world_ mutations so a
+  // remove cannot hand a slot to a replacement while installing its stub.
+  absl::Mutex mutation_mutex_;
   mutable MRMWMutex mrmw_mutex_;
 
   bool copy_vector_;                    // Whether vectors are copied into hnswlib.
