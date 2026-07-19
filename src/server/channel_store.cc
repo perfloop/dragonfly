@@ -134,6 +134,9 @@ unsigned ChannelStore::SendMessages(string_view channel, facade::ArgRange messag
     last_thread = sub_thread;
   }
 
+  if (ranges.empty())
+    return subscribers.size();
+
   auto subscribers_ptr = make_shared<decltype(subscribers)>(std::move(subscribers));
   auto send = BuildSender(channel, messages, sharded);
   for (const SubscriberRange& range : ranges) {
