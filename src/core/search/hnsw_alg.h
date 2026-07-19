@@ -1029,6 +1029,69 @@ template <typename dist_t> class HierarchicalNSW : public hnswlib::AlgorithmInte
     *((unsigned short int*)(ptr)) = *((unsigned short int*)&size);
   }
 
+  // Reuses a deleted slot only after resolving the incoming label.  The upstream
+  // addPoint(..., true) removes an arbitrary tombstone before checking whether
+  // label already names a deleted node, which can make a same-label reactivation
+  // consume another label's slot.  This path is used by Dragonfly's serialized
+  // adapter mutations, so a replaced deleted node cannot be concurrently used.
+  void addPointWithDeletedSlotReuse(const void* data_point, labeltype label) {
+    if (!allow_replace_deleted_) {
+      throw std::runtime_error("Replacement of deleted elements is disabled in constructor");
+    }
+
+    std::unique_lock<std::mutex> lock_label(getLabelOpMutex(label));
+    tableint existing_internal_id = 0;
+    bool has_existing_label = false;
+    {
+      std::unique_lock<std::mutex> lock_table(label_lookup_lock);
+      auto search = label_lookup_.find(label);
+      if (search != label_lookup_.end()) {
+        existing_internal_id = search->second;
+        has_existing_label = true;
+      }
+    }
+
+    if (has_existing_label) {
+      if (isMarkedDeleted(existing_internal_id)) {
+        unmarkDeletedInternal(existing_internal_id);
+      }
+      updatePoint(data_point, existing_internal_id, 1.0);
+      return;
+    }
+
+    tableint internal_id_replaced = 0;
+    bool has_deleted_slot = false;
+    {
+      std::unique_lock<std::mutex> lock_deleted_elements(deleted_elements_lock);
+      if (!deleted_elements.empty()) {
+        internal_id_replaced = *deleted_elements.begin();
+        deleted_elements.erase(internal_id_replaced);
+        has_deleted_slot = true;
+      }
+    }
+    if (!has_deleted_slot) {
+      // This overload does not take the label-operation lock itself.
+      addPoint(data_point, label, -1);
+      return;
+    }
+
+    // Match the existing replacement flow for an absent label.  The adapter's
+    // write lock serializes mutation of the removed label while its tombstone is
+    // being repurposed.
+    labeltype label_replaced = getExternalLabel(internal_id_replaced);
+    setExternalLabel(internal_id_replaced, label);
+    {
+      std::unique_lock<std::mutex> lock_table(label_lookup_lock);
+      label_lookup_.erase(label_replaced);
+      label_lookup_[label] = internal_id_replaced;
+    }
+
+    unmarkDeletedInternal(internal_id_replaced);
+    // repairConnectionsForUpdate still reconnects this node. Avoid recomputing
+    // every former neighbor while replacing a node that was already deleted.
+    updatePoint(data_point, internal_id_replaced, 0.0);
+  }
+
   /*
    * Adds point. Updates the point if it is already in the index.
    * If replacement of deleted elements is enabled: replaces previously deleted point if any,

@@ -62,8 +62,13 @@ struct HnswlibAdapter {
 
   explicit HnswlibAdapter(const SchemaField::VectorParams& params, bool copy_vector)
       : space_{params.dim, params.sim, params.data_type},
-        world_{&space_, params.capacity, params.hnsw_m, params.hnsw_ef_construction,
-               kSeed,   copy_vector},
+        world_{&space_,
+               params.capacity,
+               params.hnsw_m,
+               params.hnsw_ef_construction,
+               kSeed,
+               copy_vector,
+               /*allow_replace_deleted=*/true},
         copy_vector_{copy_vector},
         capacity_{params.capacity},
         M_{params.hnsw_m},
@@ -183,8 +188,8 @@ struct HnswlibAdapter {
   // invariant is violated. Must be called under the write lock.
   void ResetLocked() {
     world_.~HierarchicalNSW<float>();
-    new (&world_)
-        HierarchicalNSW<float>(&space_, capacity_, M_, ef_construction_, kSeed, copy_vector_);
+    new (&world_) HierarchicalNSW<float>(&space_, capacity_, M_, ef_construction_, kSeed,
+                                         copy_vector_, /*allow_replace_deleted=*/true);
   }
 
   // Actually add the point. Must be called while holding mrmw write lock.
@@ -192,7 +197,7 @@ struct HnswlibAdapter {
     while (true) {
       try {
         absl::ReaderMutexLock resize_lock(&resize_mutex_);
-        world_.addPoint(data, id);
+        world_.addPointWithDeletedSlotReuse(data, id);
         return;
       } catch (const std::exception& e) {
         std::string error_msg = e.what();
