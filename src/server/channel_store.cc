@@ -102,12 +102,26 @@ unsigned ChannelStore::SendMessages(string_view channel, facade::ArgRange messag
 
   // Make sure none of the threads publish buffer limits is reached. We don't reserve memory ahead
   // and don't prevent the buffer from possibly filling, but the approach is good enough for
-  // limiting fast producers. Most importantly, we can use DispatchBrief below as we block here
-  int32_t last_thread = -1;
+  // limiting fast producers. Record sorted owner ranges here so all budgets are preflighted before
+  // scheduling one DispatchBrief callback per owner below.
+  struct SubscriberRange {
+    unsigned thread_id;
+    size_t begin;
+    size_t end;
+  };
+  absl::InlinedVector<SubscriberRange, 4> ranges;
 
-  for (auto& sub : subscribers) {
+  int32_t last_thread = -1;
+  for (size_t i = 0; i < subscribers.size(); ++i) {
+    auto& sub = subscribers[i];
     int sub_thread = sub.LastKnownThreadId();
     DCHECK_LE(last_thread, sub_thread);
+
+    if (ranges.empty() || ranges.back().thread_id != static_cast<unsigned>(sub_thread))
+      ranges.push_back({static_cast<unsigned>(sub_thread), i, i + 1});
+    else
+      ranges.back().end = i + 1;
+
     if (last_thread == sub_thread)  // skip same thread
       continue;
 
@@ -122,16 +136,18 @@ unsigned ChannelStore::SendMessages(string_view channel, facade::ArgRange messag
   }
 
   auto subscribers_ptr = make_shared<decltype(subscribers)>(std::move(subscribers));
-  auto cb = [subscribers_ptr, send = BuildSender(channel, messages, sharded)](unsigned idx, auto*) {
-    auto it = lower_bound(subscribers_ptr->begin(), subscribers_ptr->end(), idx,
-                          ChannelStore::Subscriber::ByThreadId);
-    while (it != subscribers_ptr->end() && it->LastKnownThreadId() == idx) {
-      if (auto* ptr = it->Get(); ptr && ptr->cntx() != nullptr)
-        send(ptr, it->pattern);
-      it++;
-    }
-  };
-  shard_set->pool()->DispatchBrief(std::move(cb));
+  auto send = BuildSender(channel, messages, sharded);
+  for (const SubscriberRange& range : ranges) {
+    shard_set->pool()
+        ->at(range.thread_id)
+        ->DispatchBrief([subscribers_ptr, begin = range.begin, end = range.end, send]() mutable {
+          for (size_t i = begin; i < end; ++i) {
+            auto& sub = (*subscribers_ptr)[i];
+            if (auto* ptr = sub.Get(); ptr && ptr->cntx() != nullptr)
+              send(ptr, sub.pattern);
+          }
+        });
+  }
 
   return subscribers_ptr->size();
 }
