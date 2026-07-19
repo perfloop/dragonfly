@@ -102,8 +102,8 @@ unsigned ChannelStore::SendMessages(string_view channel, facade::ArgRange messag
 
   // Make sure none of the threads publish buffer limits is reached. We don't reserve memory ahead
   // and don't prevent the buffer from possibly filling, but the approach is good enough for
-  // limiting fast producers. Record sorted owner ranges here so all budgets are preflighted before
-  // scheduling one DispatchBrief callback per owner below.
+  // limiting fast producers. Record a sorted owner range only after finding its first live
+  // subscriber so all budgets are preflighted before scheduling one callback per live owner below.
   struct SubscriberRange {
     unsigned thread_id;
     size_t begin;
@@ -117,16 +117,15 @@ unsigned ChannelStore::SendMessages(string_view channel, facade::ArgRange messag
     int sub_thread = sub.LastKnownThreadId();
     DCHECK_LE(last_thread, sub_thread);
 
-    if (ranges.empty() || ranges.back().thread_id != static_cast<unsigned>(sub_thread))
-      ranges.push_back({static_cast<unsigned>(sub_thread), i, i + 1});
-    else
+    if (last_thread == sub_thread) {  // same live owner
       ranges.back().end = i + 1;
-
-    if (last_thread == sub_thread)  // skip same thread
       continue;
+    }
 
     if (sub.IsExpired())
       continue;
+
+    ranges.push_back({static_cast<unsigned>(sub_thread), i, i + 1});
 
     // Make sure the connection thread has enough memory budget to accept the message.
     // This is a heuristic and not entirely hermetic since the connection memory might
@@ -140,7 +139,7 @@ unsigned ChannelStore::SendMessages(string_view channel, facade::ArgRange messag
   for (const SubscriberRange& range : ranges) {
     shard_set->pool()
         ->at(range.thread_id)
-        ->DispatchBrief([subscribers_ptr, begin = range.begin, end = range.end, send]() mutable {
+        ->DispatchBrief([subscribers_ptr, begin = range.begin, end = range.end, send]() {
           for (size_t i = begin; i < end; ++i) {
             auto& sub = (*subscribers_ptr)[i];
             if (auto* ptr = sub.Get(); ptr && ptr->cntx() != nullptr)
