@@ -24,7 +24,8 @@ from typing import Final
 
 PRIMARY_VALUE_SIZES: Final = (8 * 1024, 16 * 1024, 32 * 1024, 64 * 1024)
 PRIMARY_REQUESTS_PER_SIZE: Final = 1200
-PRIMARY_CONNECTIONS: Final = 10
+# A normal long-lived client isolates a per-connection receive-buffer metric.
+PRIMARY_CONNECTIONS: Final = 1
 PIPELINE_DEPTH: Final = 30
 KEYSPACE: Final = 100_000
 FRAGMENTED_CONTROL_CONNECTIONS: Final = 8
