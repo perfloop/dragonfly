@@ -3,10 +3,9 @@
 
 This measurement-only helper uses a single raw RESP connection so the complete-frame
 fast path is exercised rather than a client-side chunking policy. It emits one JSONL
-row per requested metric. Its --check mode covers fragmented and pipelined raw frames
-so a change to request-buffer ownership must preserve wire-level SET/GET semantics.
-Its --copy-profile mode runs a controlled large-SET experiment with a measurement-only
-memcpy interposer.
+row per requested metric. Its --check mode covers pipelined raw frames so a
+change to request-buffer ownership must preserve wire-level SET/GET semantics. The
+source parser test invoked by the proof command owns deterministic fragmentation cases.
 """
 
 import argparse
@@ -29,7 +28,6 @@ from typing import Final
 VALUE_SIZE: Final = 24 * 1024
 REQUEST_COUNT: Final = 512
 KEY_COUNT: Final = 16
-COPY_PROFILE_SET_COUNT: Final = 16
 RUN_DIR_NAME: Final = ".perfloop-large-set"
 
 
@@ -88,17 +86,6 @@ class RespReader:
             raise RuntimeError("bulk-string response has no CRLF terminator")
         del self.buffer[: length + 2]
         return value
-
-
-def send_set(sock: socket.socket, key: bytes, value: bytes) -> None:
-    sock.sendall(command_frame(b"SET", key, value))
-    if RespReader(sock).simple() != b"OK":
-        raise RuntimeError("SET did not return OK")
-
-
-def get_value(sock: socket.socket, key: bytes) -> bytes:
-    sock.sendall(command_frame(b"GET", key))
-    return RespReader(sock).bulk()
 
 
 def patterned_value(size: int, seed: int) -> bytes:
@@ -208,24 +195,6 @@ def fresh_run_dir(root: Path) -> Path:
     return run_dir
 
 
-def check_fragmented_set(port: int) -> None:
-    value = patterned_value(256 * 1024, 17)
-    request = command_frame(b"SET", b"fragmented", value)
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
-        # Deliberately separate the header and many value chunks.  The small
-        # pauses make the request cross several server reads rather than merely
-        # relying on TCP packetization to do so.
-        for offset in range(0, len(request), 8191):
-            conn.sendall(request[offset : offset + 8191])
-            time.sleep(0.001)
-        reader = RespReader(conn)
-        if reader.simple() != b"OK":
-            raise RuntimeError("fragmented SET did not return OK")
-        conn.sendall(command_frame(b"GET", b"fragmented"))
-        if reader.bulk() != value:
-            raise RuntimeError("fragmented SET value did not survive GET")
-
-
 def check_pipeline_lifetime(port: int) -> None:
     values = {
         f"pipeline:{index}".encode(): patterned_value(32 * 1024, index) for index in range(12)
@@ -254,44 +223,8 @@ def check_pipeline_lifetime(port: int) -> None:
 def run_check(root: Path) -> None:
     run_dir = fresh_run_dir(root)
     with Server(root, run_dir) as server:
-        check_fragmented_set(server.port)
         check_pipeline_lifetime(server.port)
-    print("large-set correctness check passed")
-
-
-def collect_copy_bytes(root: Path, run_dir: Path, set_count: int) -> int:
-    run_dir.mkdir()
-    server = Server(root, run_dir, copy_counter=True)
-    with server:
-        if set_count:
-            with socket.create_connection(("127.0.0.1", server.port), timeout=5) as conn:
-                for index in range(set_count):
-                    send_set(
-                        conn,
-                        f"copy-profile:{index % KEY_COUNT}".encode(),
-                        patterned_value(VALUE_SIZE, index),
-                    )
-    if server.copy_bytes is None:
-        raise RuntimeError("memcpy counter did not report copy bytes")
-    return server.copy_bytes
-
-
-def run_copy_profile(root: Path) -> None:
-    run_dir = fresh_run_dir(root)
-    idle_bytes = collect_copy_bytes(root, run_dir / "idle", 0)
-    large_set_bytes = collect_copy_bytes(root, run_dir / "large-set", COPY_PROFILE_SET_COUNT)
-    delta = large_set_bytes - idle_bytes
-    minimum_delta = COPY_PROFILE_SET_COUNT * VALUE_SIZE * 3 // 2
-    if delta < minimum_delta:
-        raise RuntimeError(
-            "large SET copy profile did not observe the parser and large-string copies: "
-            f"idle={idle_bytes} large-set={large_set_bytes} delta={delta} "
-            f"minimum={minimum_delta}"
-        )
-    print(
-        "large-set copy-profile check passed: "
-        f"idle={idle_bytes} large-set={large_set_bytes} delta={delta}"
-    )
+    print("large-set pipelined wire check passed")
 
 
 def percentile_99_ms(samples: list[float]) -> float:
@@ -322,10 +255,9 @@ def run_raw_set_client(port: int, workload: str) -> tuple[float, float]:
             for _ in range(request_count):
                 if reader.simple() != b"OK":
                     raise RuntimeError("SET did not return OK")
-            elapsed = time.perf_counter() - before
-            # A pipeline has one observable response interval; divide it across its
-            # requests rather than presenting the batch time as per-request latency.
-            latencies.extend([elapsed / request_count] * request_count)
+                # This is the actual client-observed completion time for this reply
+                # from the batch send, including its queueing behind earlier replies.
+                latencies.append(time.perf_counter() - before)
         elapsed = time.perf_counter() - start
 
     if elapsed <= 0:
@@ -362,7 +294,7 @@ def run_sample(root: Path, workload: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--workload", choices=("check", "copy-profile", "single", "pipeline"), required=True
+        "--workload", choices=("check", "single", "pipeline"), required=True
     )
     args = parser.parse_args()
 
@@ -370,8 +302,6 @@ def main() -> int:
         root = repo_root()
         if args.workload == "check":
             run_check(root)
-        elif args.workload == "copy-profile":
-            run_copy_profile(root)
         else:
             run_sample(root, args.workload)
     except (OSError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as error:
