@@ -130,6 +130,9 @@ def run_native_bench(
     if not binary.is_file():
         raise RuntimeError(f"missing native benchmark binary: {binary}")
 
+    env = os.environ.copy()
+    # Match the repository's focused native-test fallback on kernels without io_uring.
+    env["FLAGS_force_epoll"] = "true"
     result = subprocess.run(
         [
             str(binary),
@@ -149,6 +152,7 @@ def run_native_bench(
             "--probe_cluster=false",
         ],
         cwd=root,
+        env=env,
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
