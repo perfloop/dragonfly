@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Measure copied bytes while Dragonfly's native SET benchmark runs.
+"""Measure server-side copied bytes for a standard pipelined RESP SET workload.
 
-The workload generator is the repository's ``dfly_bench`` client, not a
-hand-written RESP sender.  Its 8 KiB--64 KiB value sweep uses runtime-varying
-payload sizes and its pipeline depth matches the 30-request pipeline used by
-``tools/benchmark/k8s-benchmark-job.yaml``.  The separate fresh-connection
-workload is a control for the fragmented large-bulk fallback.
+The load generator is Redis' standard ``redis-benchmark`` client.  It uses the
+same 30-request pipeline and 100,000-key space as this repository's documented
+memtier Kubernetes benchmark, while sampling ordinary 8 KiB, 16 KiB, 32 KiB,
+and 64 KiB SET payloads.  It does not send handcrafted RESP frames or a
+capacity-training warmup.  The fresh-connection workload is a separate control
+for the fragmented large-bulk fallback.
 """
 
 import argparse
@@ -21,8 +22,11 @@ from pathlib import Path
 from typing import Final
 
 
-NATIVE_RANGE_OPS: Final = 512
-NATIVE_RANGE_PIPELINE: Final = 30
+PRIMARY_VALUE_SIZES: Final = (8 * 1024, 16 * 1024, 32 * 1024, 64 * 1024)
+PRIMARY_REQUESTS_PER_SIZE: Final = 1200
+PRIMARY_CONNECTIONS: Final = 10
+PIPELINE_DEPTH: Final = 30
+KEYSPACE: Final = 100_000
 FRAGMENTED_CONTROL_CONNECTIONS: Final = 8
 RUN_DIR_NAME: Final = ".perfloop-large-set"
 
@@ -117,75 +121,75 @@ def fresh_run_dir(root: Path) -> Path:
     return run_dir
 
 
-def run_native_bench(
+def run_redis_benchmark(
     root: Path,
     port: int,
     *,
     connections: int,
-    requests_per_connection: int,
+    requests: int,
     pipeline: int,
-    data_size: str,
+    data_size: int,
 ) -> None:
-    binary = root / ".perfloop-build" / "dfly_bench"
+    binary = root / ".perfloop-redis-src" / "src" / "redis-benchmark"
     if not binary.is_file():
-        raise RuntimeError(f"missing native benchmark binary: {binary}")
+        raise RuntimeError(f"missing standard benchmark binary: {binary}")
 
-    env = os.environ.copy()
-    # Match the repository's focused native-test fallback on kernels without io_uring.
-    env["FLAGS_force_epoll"] = "true"
     result = subprocess.run(
         [
             str(binary),
-            "--h=127.0.0.1",
-            f"--p={port}",
-            f"--c={connections}",
-            f"--n={requests_per_connection}",
-            f"--pipeline={pipeline}",
-            f"--d={data_size}",
-            "--ratio=1:0",
-            "--qps=0",
-            "--key_dist=S",
-            "--key_minimum=0",
-            "--key_maximum=65535",
-            "--random_data=true",
-            "--tcp_nodelay=true",
-            "--probe_cluster=false",
+            "-h",
+            "127.0.0.1",
+            "-p",
+            str(port),
+            "-c",
+            str(connections),
+            "-n",
+            str(requests),
+            "-P",
+            str(pipeline),
+            "-d",
+            str(data_size),
+            "-t",
+            "set",
+            "-r",
+            str(KEYSPACE),
+            "-q",
         ],
         cwd=root,
-        env=env,
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
     if result.returncode:
-        raise RuntimeError(f"dfly_bench failed ({result.returncode}):\n{result.stdout[-4000:]}")
+        raise RuntimeError(f"redis-benchmark failed ({result.returncode}):\n{result.stdout[-4000:]}")
 
 
-def measure_native_range(root: Path) -> float:
+def measure_standard_range(root: Path) -> float:
     with Server(root, fresh_run_dir(root)) as server:
-        run_native_bench(
-            root,
-            server.port,
-            connections=1,
-            requests_per_connection=NATIVE_RANGE_OPS,
-            pipeline=NATIVE_RANGE_PIPELINE,
-            data_size="8192:65536",
-        )
+        for data_size in PRIMARY_VALUE_SIZES:
+            run_redis_benchmark(
+                root,
+                server.port,
+                connections=PRIMARY_CONNECTIONS,
+                requests=PRIMARY_REQUESTS_PER_SIZE,
+                pipeline=PIPELINE_DEPTH,
+                data_size=data_size,
+            )
     if server.copy_bytes is None:
         raise RuntimeError("memcpy counter did not report copy bytes")
-    return server.copy_bytes / NATIVE_RANGE_OPS
+    return server.copy_bytes / (len(PRIMARY_VALUE_SIZES) * PRIMARY_REQUESTS_PER_SIZE)
 
 
 def measure_fragmented_control(root: Path) -> float:
     with Server(root, fresh_run_dir(root)) as server:
-        run_native_bench(
+        run_redis_benchmark(
             root,
             server.port,
             connections=FRAGMENTED_CONTROL_CONNECTIONS,
-            requests_per_connection=1,
+            requests=FRAGMENTED_CONTROL_CONNECTIONS,
             pipeline=1,
-            data_size="1048576",
+            data_size=1024 * 1024,
         )
     if server.copy_bytes is None:
         raise RuntimeError("memcpy counter did not report copy bytes")
@@ -194,14 +198,14 @@ def measure_fragmented_control(root: Path) -> float:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--workload", choices=("native-range", "fragmented-1m"), required=True)
+    parser.add_argument("--workload", choices=("standard-range", "fragmented-1m"), required=True)
     args = parser.parse_args()
 
     try:
         root = Path.cwd()
-        if args.workload == "native-range":
-            metric = "native_pipelined_8k_64k_resp_set_copy_bytes_per_op"
-            value = measure_native_range(root)
+        if args.workload == "standard-range":
+            metric = "standard_pipelined_8k_64k_resp_set_copy_bytes_per_op"
+            value = measure_standard_range(root)
         else:
             metric = "fresh_connection_1m_resp_set_copy_bytes_per_op"
             value = measure_fragmented_control(root)
