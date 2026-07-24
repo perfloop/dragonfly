@@ -4,14 +4,17 @@
 This measurement-only helper starts the locally built server, consumes the standard
 client's CSV report, and emits one JSONL row per requested metric. Its --check mode
 covers fragmented and pipelined raw frames so a change to request-buffer ownership
-must preserve wire-level SET/GET semantics.
+must preserve wire-level SET/GET semantics. Its --copy-profile mode runs a controlled
+large-SET experiment with a measurement-only memcpy interposer.
 """
 
 import argparse
 import csv
 import json
+import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -22,6 +25,7 @@ from typing import Final
 VALUE_SIZE: Final = 1 << 20
 REQUEST_COUNT: Final = 512
 KEY_COUNT: Final = 16
+COPY_PROFILE_SET_COUNT: Final = 16
 RUN_DIR_NAME: Final = ".perfloop-large-set"
 
 
@@ -107,18 +111,35 @@ def choose_port() -> int:
 
 
 class Server:
-    def __init__(self, root: Path, run_dir: Path):
+    def __init__(self, root: Path, run_dir: Path, copy_counter: bool = False):
         self.root = root
         self.run_dir = run_dir
+        self.copy_counter = copy_counter
         self.port = choose_port()
         self.process: subprocess.Popen[bytes] | None = None
         self.log_path = run_dir / "server.log"
         self.log_file = None
+        self.counter_path: Path | None = None
+        self.copy_bytes: int | None = None
+        self.copy_calls: int | None = None
 
     def __enter__(self) -> "Server":
         binary = self.root / ".perfloop-build" / "dragonfly"
         if not binary.is_file():
             raise RuntimeError(f"missing server binary: {binary}")
+
+        env = None
+        if self.copy_counter:
+            counter_library = self.root / ".perfloop-build" / "perfloop_memcpy_counter.so"
+            if not counter_library.is_file():
+                raise RuntimeError(f"missing memcpy counter library: {counter_library}")
+            self.counter_path = self.run_dir / "memcpy-counter.bin"
+            env = os.environ.copy()
+            preload = env.get("LD_PRELOAD")
+            env["LD_PRELOAD"] = (
+                f"{counter_library}:{preload}" if preload else str(counter_library)
+            )
+            env["PERFLOOP_MEMCPY_COUNTER_PATH"] = str(self.counter_path)
 
         self.log_file = self.log_path.open("wb")
         self.process = subprocess.Popen(
@@ -133,6 +154,7 @@ class Server:
                 "--logtostderr",
             ],
             cwd=self.root,
+            env=env,
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
         )
@@ -167,6 +189,12 @@ class Server:
                 self.process.wait(timeout=10)
         if self.log_file is not None:
             self.log_file.close()
+        if self.counter_path is not None:
+            try:
+                raw_counter = self.counter_path.read_bytes()
+                self.copy_calls, self.copy_bytes = struct.unpack("<QQ", raw_counter)
+            except (OSError, struct.error) as error:
+                raise RuntimeError(f"could not read memcpy counter: {error}") from error
 
 
 def fresh_run_dir(root: Path) -> Path:
@@ -227,6 +255,41 @@ def run_check(root: Path) -> None:
     print("large-set correctness check passed")
 
 
+def collect_copy_bytes(root: Path, run_dir: Path, set_count: int) -> int:
+    run_dir.mkdir()
+    server = Server(root, run_dir, copy_counter=True)
+    with server:
+        if set_count:
+            with socket.create_connection(("127.0.0.1", server.port), timeout=5) as conn:
+                for index in range(set_count):
+                    send_set(
+                        conn,
+                        f"copy-profile:{index % KEY_COUNT}".encode(),
+                        patterned_value(VALUE_SIZE, index),
+                    )
+    if server.copy_bytes is None:
+        raise RuntimeError("memcpy counter did not report copy bytes")
+    return server.copy_bytes
+
+
+def run_copy_profile(root: Path) -> None:
+    run_dir = fresh_run_dir(root)
+    idle_bytes = collect_copy_bytes(root, run_dir / "idle", 0)
+    large_set_bytes = collect_copy_bytes(root, run_dir / "large-set", COPY_PROFILE_SET_COUNT)
+    delta = large_set_bytes - idle_bytes
+    minimum_delta = COPY_PROFILE_SET_COUNT * VALUE_SIZE * 3 // 2
+    if delta < minimum_delta:
+        raise RuntimeError(
+            "large SET copy profile did not observe the parser and large-string copies: "
+            f"idle={idle_bytes} large-set={large_set_bytes} delta={delta} "
+            f"minimum={minimum_delta}"
+        )
+    print(
+        "large-set copy-profile check passed: "
+        f"idle={idle_bytes} large-set={large_set_bytes} delta={delta}"
+    )
+
+
 def require_clean_benchmark(report_path: Path) -> tuple[float, float]:
     try:
         with report_path.open(newline="") as report_file:
@@ -260,7 +323,8 @@ def run_sample(root: Path, workload: str) -> None:
     report_path = run_dir / "redis-benchmark.csv"
     stderr_path = run_dir / "redis-benchmark.stderr"
 
-    with Server(root, run_dir) as server:
+    server = Server(root, run_dir, copy_counter=True)
+    with server:
         with report_path.open("w", newline="") as output, stderr_path.open("wb") as errors:
             result = subprocess.run(
                 [
@@ -299,23 +363,37 @@ def run_sample(root: Path, workload: str) -> None:
             )
         ops_per_sec, p99_ms = require_clean_benchmark(report_path)
 
+    if server.copy_bytes is None:
+        raise RuntimeError("memcpy counter did not report copy bytes")
+    copy_bytes_per_op = server.copy_bytes / REQUEST_COUNT
+
     print(
         json.dumps(
             {"metric": f"{metric_prefix}_ops_per_sec", "value": ops_per_sec}, allow_nan=False
         )
     )
     print(json.dumps({"metric": f"{metric_prefix}_p99_ms", "value": p99_ms}, allow_nan=False))
+    print(
+        json.dumps(
+            {"metric": f"{metric_prefix}_copy_bytes_per_op", "value": copy_bytes_per_op},
+            allow_nan=False,
+        )
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--workload", choices=("check", "single", "pipeline"), required=True)
+    parser.add_argument(
+        "--workload", choices=("check", "copy-profile", "single", "pipeline"), required=True
+    )
     args = parser.parse_args()
 
     try:
         root = repo_root()
         if args.workload == "check":
             run_check(root)
+        elif args.workload == "copy-profile":
+            run_copy_profile(root)
         else:
             run_sample(root, args.workload)
     except (OSError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as error:
