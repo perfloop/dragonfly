@@ -58,14 +58,9 @@ async def test_complete_bulk_set_survives_connection_buffer_reuse(
     values = {f"complete-bulk:{index}".encode(): payload(index) for index in range(4)}
 
     try:
-        # The warmup grows the parser-hinted receive buffer. Every following 24 KiB
-        # frame fits in its 32 KiB capacity and can take the complete-bulk route.
-        writer.write(resp_command(b"SET", b"complete-bulk:warmup", payload(99)))
-        await writer.drain()
-        await read_simple(reader)
-
-        # Send two waves before consuming replies. ParseRedis can consume and reuse
-        # its IoBuf while earlier ParsedCommands are still queued for dispatch.
+        # Send a sustained ordinary SET stream before consuming replies. As the
+        # connection parses its first bulk body, its normal parser hint grows the
+        # receive buffer; later frames exercise reuse of that same buffer.
         writer.write(b"".join(resp_command(b"SET", key, value) for key, value in values.items()))
         writer.write(b"".join(resp_command(b"SET", key, value) for key, value in values.items()))
         await writer.drain()
