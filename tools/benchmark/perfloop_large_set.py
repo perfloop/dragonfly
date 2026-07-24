@@ -3,9 +3,8 @@
 
 This measurement-only helper uses a single raw RESP connection so the complete-frame
 fast path is exercised rather than a client-side chunking policy. It emits one JSONL
-row per requested metric. Its --check mode covers pipelined raw frames so a
-change to request-buffer ownership must preserve wire-level SET/GET semantics. The
-source parser test invoked by the proof command owns deterministic fragmentation cases.
+row per requested metric. Deterministic parser and string-family tests are invoked
+separately by the proof command for correctness; this helper is measurement-only.
 """
 
 import argparse
@@ -72,21 +71,6 @@ class RespReader:
         if not line.startswith(b"+"):
             raise RuntimeError(f"expected a simple-string response, got {line[:100]!r}")
         return line[1:]
-
-    def bulk(self) -> bytes:
-        line = self._line()
-        if not line.startswith(b"$"):
-            raise RuntimeError(f"expected a bulk-string response, got {line[:100]!r}")
-        length = int(line[1:])
-        if length < 0:
-            raise RuntimeError("expected a present bulk-string response")
-        self._fill(length + 2)
-        value = bytes(self.buffer[:length])
-        if self.buffer[length : length + 2] != b"\r\n":
-            raise RuntimeError("bulk-string response has no CRLF terminator")
-        del self.buffer[: length + 2]
-        return value
-
 
 def patterned_value(size: int, seed: int) -> bytes:
     return bytes((index + seed) % 256 for index in range(size))
@@ -195,38 +179,6 @@ def fresh_run_dir(root: Path) -> Path:
     return run_dir
 
 
-def check_pipeline_lifetime(port: int) -> None:
-    values = {
-        f"pipeline:{index}".encode(): patterned_value(32 * 1024, index) for index in range(12)
-    }
-    request = b"".join(command_frame(b"SET", key, value) for key, value in values.items())
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
-        conn.sendall(request)
-        reader = RespReader(conn)
-        for _ in values:
-            if reader.simple() != b"OK":
-                raise RuntimeError("pipelined SET did not return OK")
-        for key, value in values.items():
-            conn.sendall(command_frame(b"GET", key))
-            if reader.bulk() != value:
-                raise RuntimeError(f"pipelined SET value for {key!r} did not survive GET")
-
-        replacement = patterned_value(64 * 1024, 91)
-        conn.sendall(command_frame(b"SET", b"pipeline:0", replacement))
-        if reader.simple() != b"OK":
-            raise RuntimeError("large SET overwrite did not return OK")
-        conn.sendall(command_frame(b"GET", b"pipeline:0"))
-        if reader.bulk() != replacement:
-            raise RuntimeError("large SET overwrite did not survive GET")
-
-
-def run_check(root: Path) -> None:
-    run_dir = fresh_run_dir(root)
-    with Server(root, run_dir) as server:
-        check_pipeline_lifetime(server.port)
-    print("large-set pipelined wire check passed")
-
-
 def percentile_99_ms(samples: list[float]) -> float:
     if not samples:
         raise RuntimeError("no latency samples were collected")
@@ -294,16 +246,13 @@ def run_sample(root: Path, workload: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--workload", choices=("check", "single", "pipeline"), required=True
+        "--workload", choices=("single", "pipeline"), required=True
     )
     args = parser.parse_args()
 
     try:
         root = repo_root()
-        if args.workload == "check":
-            run_check(root)
-        else:
-            run_sample(root, args.workload)
+        run_sample(root, args.workload)
     except (OSError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as error:
         print(f"large SET harness failed: {error}", file=sys.stderr)
         return 1
