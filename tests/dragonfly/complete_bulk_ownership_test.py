@@ -1,6 +1,9 @@
 import asyncio
+from collections.abc import Iterator
 
-from .instance import DflyInstance
+import pytest
+
+from .instance import DflyInstance, DflyInstanceFactory
 
 
 VALUE_SIZE = 24 * 1024
@@ -32,10 +35,25 @@ async def read_bulk(reader: asyncio.StreamReader) -> bytes:
     return value_with_crlf[:-2]
 
 
-async def test_complete_bulk_set_survives_connection_buffer_reuse(df_server: DflyInstance):
+@pytest.fixture
+def complete_bulk_server(df_factory: DflyInstanceFactory) -> Iterator[DflyInstance]:
+    instance = df_factory.create()
+    # This test needs only the real socket server; collecting diagnostics through
+    # /proc is unrelated and is not supported by the controller's procfs mount.
+    instance.get_logs_from_psutil = lambda: []
+    instance.start()
+    try:
+        yield instance
+    finally:
+        instance.stop()
+
+
+async def test_complete_bulk_set_survives_connection_buffer_reuse(
+    complete_bulk_server: DflyInstance,
+):
     """Keep values correct after ParseRedis consumes and reuses its receive buffer."""
     reader, writer = await asyncio.open_connection(
-        "127.0.0.1", df_server.port, limit=2 * VALUE_SIZE
+        "127.0.0.1", complete_bulk_server.port, limit=2 * VALUE_SIZE
     )
     values = {f"complete-bulk:{index}".encode(): payload(index) for index in range(4)}
 
