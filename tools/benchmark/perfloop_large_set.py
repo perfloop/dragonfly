@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise complete 1 MiB raw RESP SET frames against a local Dragonfly server.
+"""Exercise complete 24 KiB raw RESP SET frames against a local Dragonfly server.
 
 This measurement-only helper uses a single raw RESP connection so the complete-frame
 fast path is exercised rather than a client-side chunking policy. It emits one JSONL
@@ -22,7 +22,11 @@ from pathlib import Path
 from typing import Final
 
 
-VALUE_SIZE: Final = 1 << 20
+# A 24 KiB bulk causes Dragonfly's parser-hinted receive buffer to round up to
+# 32 KiB. Subsequent 24 KiB RESP frames fit in that buffer as complete bulks;
+# a 32 KiB bulk plus RESP framing spills into the next receive and exercises
+# only the fragmented fallback.
+VALUE_SIZE: Final = 24 * 1024
 REQUEST_COUNT: Final = 512
 KEY_COUNT: Final = 16
 COPY_PROFILE_SET_COUNT: Final = 16
@@ -331,7 +335,7 @@ def run_raw_set_client(port: int, workload: str) -> tuple[float, float]:
 
 def run_sample(root: Path, workload: str) -> None:
     run_dir = fresh_run_dir(root)
-    metric_prefix = f"large_resp_set_{workload}"
+    metric_prefix = f"complete_24k_resp_set_{workload}"
 
     server = Server(root, run_dir, copy_counter=True)
     with server:
