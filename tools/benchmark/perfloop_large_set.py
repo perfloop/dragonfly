@@ -7,7 +7,6 @@ row per requested metric. Deterministic parser and string-family tests are invok
 separately by the proof command for correctness; this helper is measurement-only.
 """
 
-import argparse
 import json
 import os
 import shutil
@@ -179,80 +178,41 @@ def fresh_run_dir(root: Path) -> Path:
     return run_dir
 
 
-def percentile_99_ms(samples: list[float]) -> float:
-    if not samples:
-        raise RuntimeError("no latency samples were collected")
-    rank = (99 * len(samples) + 99) // 100 - 1
-    return sorted(samples)[rank] * 1000
-
-
-def run_raw_set_client(port: int, workload: str) -> tuple[float, float]:
+def run_raw_set_client(port: int) -> None:
     keys = [f"large-set:{index}".encode() for index in range(KEY_COUNT)]
     values = [patterned_value(VALUE_SIZE, 17 + index) for index in range(KEY_COUNT)]
     frames = [command_frame(b"SET", key, value) for key, value in zip(keys, values)]
-    pipeline = 1 if workload == "single" else 16
-    latencies: list[float] = []
 
     with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         reader = RespReader(conn)
-        start = time.perf_counter()
-        for offset in range(0, REQUEST_COUNT, pipeline):
-            request_count = min(pipeline, REQUEST_COUNT - offset)
-            request = b"".join(
-                frames[(offset + index) % KEY_COUNT] for index in range(request_count)
-            )
-            before = time.perf_counter()
-            conn.sendall(request)
-            for _ in range(request_count):
-                if reader.simple() != b"OK":
-                    raise RuntimeError("SET did not return OK")
-                # This is the actual client-observed completion time for this reply
-                # from the batch send, including its queueing behind earlier replies.
-                latencies.append(time.perf_counter() - before)
-        elapsed = time.perf_counter() - start
-
-    if elapsed <= 0:
-        raise RuntimeError("raw SET benchmark recorded no elapsed time")
-    return REQUEST_COUNT / elapsed, percentile_99_ms(latencies)
+        for index in range(REQUEST_COUNT):
+            conn.sendall(frames[index % KEY_COUNT])
+            if reader.simple() != b"OK":
+                raise RuntimeError("SET did not return OK")
 
 
-def run_sample(root: Path, workload: str) -> None:
+def run_sample(root: Path) -> None:
     run_dir = fresh_run_dir(root)
-    metric_prefix = f"complete_24k_resp_set_{workload}"
-
     server = Server(root, run_dir, copy_counter=True)
     with server:
-        ops_per_sec, p99_ms = run_raw_set_client(server.port, workload)
+        run_raw_set_client(server.port)
 
     if server.copy_bytes is None:
         raise RuntimeError("memcpy counter did not report copy bytes")
     copy_bytes_per_op = server.copy_bytes / REQUEST_COUNT
-
     print(
         json.dumps(
-            {"metric": f"{metric_prefix}_ops_per_sec", "value": ops_per_sec}, allow_nan=False
-        )
-    )
-    print(json.dumps({"metric": f"{metric_prefix}_p99_ms", "value": p99_ms}, allow_nan=False))
-    print(
-        json.dumps(
-            {"metric": f"{metric_prefix}_copy_bytes_per_op", "value": copy_bytes_per_op},
+            {"metric": "complete_24k_resp_set_copy_bytes_per_op", "value": copy_bytes_per_op},
             allow_nan=False,
         )
     )
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--workload", choices=("single", "pipeline"), required=True
-    )
-    args = parser.parse_args()
-
     try:
         root = repo_root()
-        run_sample(root, args.workload)
+        run_sample(root)
     except (OSError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as error:
         print(f"large SET harness failed: {error}", file=sys.stderr)
         return 1
