@@ -3,10 +3,11 @@
 
 The load generator is Redis' standard ``redis-benchmark`` client.  It uses the
 same 30-request pipeline and 100,000-key space as this repository's documented
-memtier Kubernetes benchmark, while sampling ordinary 8 KiB, 16 KiB, 32 KiB,
-and 64 KiB SET payloads.  It does not send handcrafted RESP frames or a
-capacity-training warmup.  The fresh-connection workload is a separate control
-for the fragmented large-bulk fallback.
+memtier Kubernetes benchmark, while sampling 8 KiB, 16 KiB, 32 KiB, and 64 KiB
+raw binary SET payloads through the client's binary-safe ``-x`` input option.
+It does not send handcrafted RESP frames or a capacity-training warmup.  The
+fresh-connection workload is a separate control for the fragmented large-bulk
+fallback.
 """
 
 import argparse
@@ -148,22 +149,22 @@ def run_redis_benchmark(
             str(requests),
             "-P",
             str(pipeline),
-            "-d",
-            str(data_size),
-            "-t",
-            "set",
             "-r",
             str(KEYSPACE),
             "-q",
+            "-x",
+            "SET",
+            "large-set:__rand_int__",
         ],
         cwd=root,
+        input=os.urandom(data_size),
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
     )
     if result.returncode:
-        raise RuntimeError(f"redis-benchmark failed ({result.returncode}):\n{result.stdout[-4000:]}")
+        output = result.stdout.decode(errors="replace")
+        raise RuntimeError(f"redis-benchmark failed ({result.returncode}):\n{output[-4000:]}")
 
 
 def measure_standard_range(root: Path) -> float:
