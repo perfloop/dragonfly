@@ -116,7 +116,7 @@ class Server:
         self.log_file = None
 
     def __enter__(self) -> "Server":
-        binary = self.root / ".perfloop-build" / "src" / "server" / "dragonfly"
+        binary = self.root / ".perfloop-build" / "dragonfly"
         if not binary.is_file():
             raise RuntimeError(f"missing server binary: {binary}")
 
@@ -260,7 +260,7 @@ def validate_benchmark_value(port: int) -> None:
 
 def run_sample(root: Path, workload: str) -> None:
     run_dir = fresh_run_dir(root)
-    bench = root / ".perfloop-build" / "src" / "server" / "dfly_bench"
+    bench = root / ".perfloop-build" / "dfly_bench"
     if not bench.is_file():
         raise RuntimeError(f"missing dfly_bench binary: {bench}")
 
