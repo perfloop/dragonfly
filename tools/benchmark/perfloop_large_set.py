@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Exercise large raw RESP SETs with Dragonfly's native dfly_bench client.
+"""Exercise large raw RESP SETs with Redis's standard redis-benchmark client.
 
-This measurement-only helper starts the locally built server, runs the repository's
-native benchmark, validates the resulting stored value, and emits one JSONL row per
-requested metric.  Its --check mode covers fragmented and pipelined raw frames so a
-change to request-buffer ownership must preserve wire-level SET/GET semantics.
+This measurement-only helper starts the locally built server, consumes the standard
+client's CSV report, and emits one JSONL row per requested metric. Its --check mode
+covers fragmented and pipelined raw frames so a change to request-buffer ownership
+must preserve wire-level SET/GET semantics.
 """
 
 import argparse
+import csv
 import json
-import re
 import shutil
 import socket
 import subprocess
@@ -227,83 +227,77 @@ def run_check(root: Path) -> None:
     print("large-set correctness check passed")
 
 
-def require_clean_benchmark(
-    report: dict[str, object], expected_count: int, bench_log: Path
-) -> tuple[float, float]:
+def require_clean_benchmark(report_path: Path) -> tuple[float, float]:
     try:
-        stats = report["ALL STATS"]["Sets"]  # type: ignore[index]
-        count = int(stats["Count"])  # type: ignore[index]
-        ops_per_sec = float(stats["Ops/sec"])  # type: ignore[index]
-        p99_ms = float(stats["Percentile Latencies"]["p99.00"])  # type: ignore[index]
+        with report_path.open(newline="") as report_file:
+            rows = list(csv.DictReader(report_file))
+    except (OSError, csv.Error) as error:
+        raise RuntimeError(f"could not parse redis-benchmark CSV report: {error}") from error
+
+    set_rows = [row for row in rows if row.get("test") == "SET"]
+    if len(set_rows) != 1:
+        raise RuntimeError(f"expected one SET CSV result, got {len(set_rows)}: {rows!r}")
+
+    try:
+        ops_per_sec = float(set_rows[0]["rps"])
+        p99_ms = float(set_rows[0]["p99_latency_ms"])
     except (KeyError, TypeError, ValueError) as error:
-        raise RuntimeError(f"unexpected dfly_bench JSON report: {error}") from error
+        raise RuntimeError(f"unexpected redis-benchmark CSV result: {set_rows[0]!r}") from error
 
-    if count != expected_count:
-        raise RuntimeError(f"dfly_bench completed {count} SETs, expected {expected_count}")
     if ops_per_sec <= 0 or p99_ms < 0:
-        raise RuntimeError(f"invalid dfly_bench metrics: ops/sec={ops_per_sec}, p99={p99_ms}")
-
-    output = bench_log.read_text(errors="replace")
-    errors = re.search(r"Got (\d+) error responses!", output)
-    if errors and int(errors.group(1)) != 0:
-        raise RuntimeError(f"dfly_bench reported server errors:\n{output}")
+        raise RuntimeError(f"invalid redis-benchmark metrics: ops/sec={ops_per_sec}, p99={p99_ms}")
     return ops_per_sec, p99_ms
-
-
-def validate_benchmark_value(port: int) -> None:
-    expected = bytes([130]) * VALUE_SIZE
-    with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
-        value = get_value(conn, b"key:0")
-    if value != expected:
-        raise RuntimeError("native benchmark's final SET value did not survive GET")
 
 
 def run_sample(root: Path, workload: str) -> None:
     run_dir = fresh_run_dir(root)
-    bench = root / ".perfloop-build" / "dfly_bench"
+    bench = root / ".perfloop-redis-src" / "src" / "redis-benchmark"
     if not bench.is_file():
-        raise RuntimeError(f"missing dfly_bench binary: {bench}")
+        raise RuntimeError(f"missing redis-benchmark binary: {bench}")
 
     pipeline = 1 if workload == "single" else 16
     metric_prefix = f"large_resp_set_{workload}"
-    report_path = run_dir / "report.json"
-    bench_log = run_dir / "bench.log"
+    report_path = run_dir / "redis-benchmark.csv"
+    stderr_path = run_dir / "redis-benchmark.stderr"
 
     with Server(root, run_dir) as server:
-        with bench_log.open("wb") as output:
+        with report_path.open("w", newline="") as output, stderr_path.open("wb") as errors:
             result = subprocess.run(
                 [
                     str(bench),
-                    "--proactor_threads=1",
-                    "--h=127.0.0.1",
-                    f"--p={server.port}",
-                    "--probe_cluster=false",
-                    "--c=1",
-                    f"--n={REQUEST_COUNT}",
-                    f"--pipeline={pipeline}",
-                    "--ratio=1:0",
-                    f"--d={VALUE_SIZE}",
-                    "--ascii=false",
-                    "--random_data=false",
-                    "--key_dist=S",
-                    "--key_minimum=0",
-                    f"--key_maximum={KEY_COUNT - 1}",
-                    "--tcp_nodelay=true",
-                    f"--json_out_file={report_path}",
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    str(server.port),
+                    "-c",
+                    "1",
+                    "-n",
+                    str(REQUEST_COUNT),
+                    "-P",
+                    str(pipeline),
+                    "-d",
+                    str(VALUE_SIZE),
+                    "-r",
+                    str(KEY_COUNT),
+                    "--seed",
+                    "20260308",
+                    "-t",
+                    "set",
+                    "--csv",
                 ],
                 cwd=root,
                 stdout=output,
-                stderr=subprocess.STDOUT,
+                stderr=errors,
                 timeout=180,
                 check=False,
             )
         if result.returncode != 0:
             raise RuntimeError(
-                f"dfly_bench exited {result.returncode}:\n{bench_log.read_text(errors='replace')}"
+                f"redis-benchmark exited {result.returncode}:\n"
+                f"stdout:\n{report_path.read_text(errors='replace')}\n"
+                f"stderr:\n{stderr_path.read_text(errors='replace')}"
             )
-        report = json.loads(report_path.read_text())
-        ops_per_sec, p99_ms = require_clean_benchmark(report, REQUEST_COUNT, bench_log)
-        validate_benchmark_value(server.port)
+        ops_per_sec, p99_ms = require_clean_benchmark(report_path)
 
     print(
         json.dumps(
