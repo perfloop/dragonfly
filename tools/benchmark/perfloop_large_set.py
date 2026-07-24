@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Exercise large raw RESP SETs with Redis's standard redis-benchmark client.
+"""Exercise complete 1 MiB raw RESP SET frames against a local Dragonfly server.
 
-This measurement-only helper starts the locally built server, consumes the standard
-client's CSV report, and emits one JSONL row per requested metric. Its --check mode
-covers fragmented and pipelined raw frames so a change to request-buffer ownership
-must preserve wire-level SET/GET semantics. Its --copy-profile mode runs a controlled
-large-SET experiment with a measurement-only memcpy interposer.
+This measurement-only helper uses a single raw RESP connection so the complete-frame
+fast path is exercised rather than a client-side chunking policy. It emits one JSONL
+row per requested metric. Its --check mode covers fragmented and pipelined raw frames
+so a change to request-buffer ownership must preserve wire-level SET/GET semantics.
+Its --copy-profile mode runs a controlled large-SET experiment with a measurement-only
+memcpy interposer.
 """
 
 import argparse
-import csv
 import json
 import os
 import shutil
@@ -290,78 +290,52 @@ def run_copy_profile(root: Path) -> None:
     )
 
 
-def require_clean_benchmark(report_path: Path) -> tuple[float, float]:
-    try:
-        with report_path.open(newline="") as report_file:
-            rows = list(csv.DictReader(report_file))
-    except (OSError, csv.Error) as error:
-        raise RuntimeError(f"could not parse redis-benchmark CSV report: {error}") from error
+def percentile_99_ms(samples: list[float]) -> float:
+    if not samples:
+        raise RuntimeError("no latency samples were collected")
+    rank = (99 * len(samples) + 99) // 100 - 1
+    return sorted(samples)[rank] * 1000
 
-    set_rows = [row for row in rows if row.get("test") == "SET"]
-    if len(set_rows) != 1:
-        raise RuntimeError(f"expected one SET CSV result, got {len(set_rows)}: {rows!r}")
 
-    try:
-        ops_per_sec = float(set_rows[0]["rps"])
-        p99_ms = float(set_rows[0]["p99_latency_ms"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise RuntimeError(f"unexpected redis-benchmark CSV result: {set_rows[0]!r}") from error
+def run_raw_set_client(port: int, workload: str) -> tuple[float, float]:
+    keys = [f"large-set:{index}".encode() for index in range(KEY_COUNT)]
+    values = [patterned_value(VALUE_SIZE, 17 + index) for index in range(KEY_COUNT)]
+    frames = [command_frame(b"SET", key, value) for key, value in zip(keys, values)]
+    pipeline = 1 if workload == "single" else 16
+    latencies: list[float] = []
 
-    if ops_per_sec <= 0 or p99_ms < 0:
-        raise RuntimeError(f"invalid redis-benchmark metrics: ops/sec={ops_per_sec}, p99={p99_ms}")
-    return ops_per_sec, p99_ms
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        reader = RespReader(conn)
+        start = time.perf_counter()
+        for offset in range(0, REQUEST_COUNT, pipeline):
+            request_count = min(pipeline, REQUEST_COUNT - offset)
+            request = b"".join(
+                frames[(offset + index) % KEY_COUNT] for index in range(request_count)
+            )
+            before = time.perf_counter()
+            conn.sendall(request)
+            for _ in range(request_count):
+                if reader.simple() != b"OK":
+                    raise RuntimeError("SET did not return OK")
+            elapsed = time.perf_counter() - before
+            # A pipeline has one observable response interval; divide it across its
+            # requests rather than presenting the batch time as per-request latency.
+            latencies.extend([elapsed / request_count] * request_count)
+        elapsed = time.perf_counter() - start
+
+    if elapsed <= 0:
+        raise RuntimeError("raw SET benchmark recorded no elapsed time")
+    return REQUEST_COUNT / elapsed, percentile_99_ms(latencies)
 
 
 def run_sample(root: Path, workload: str) -> None:
     run_dir = fresh_run_dir(root)
-    bench = root / ".perfloop-redis-src" / "src" / "redis-benchmark"
-    if not bench.is_file():
-        raise RuntimeError(f"missing redis-benchmark binary: {bench}")
-
-    pipeline = 1 if workload == "single" else 16
     metric_prefix = f"large_resp_set_{workload}"
-    report_path = run_dir / "redis-benchmark.csv"
-    stderr_path = run_dir / "redis-benchmark.stderr"
 
     server = Server(root, run_dir, copy_counter=True)
     with server:
-        with report_path.open("w", newline="") as output, stderr_path.open("wb") as errors:
-            result = subprocess.run(
-                [
-                    str(bench),
-                    "-h",
-                    "127.0.0.1",
-                    "-p",
-                    str(server.port),
-                    "-c",
-                    "1",
-                    "-n",
-                    str(REQUEST_COUNT),
-                    "-P",
-                    str(pipeline),
-                    "-d",
-                    str(VALUE_SIZE),
-                    "-r",
-                    str(KEY_COUNT),
-                    "--seed",
-                    "20260308",
-                    "-t",
-                    "set",
-                    "--csv",
-                ],
-                cwd=root,
-                stdout=output,
-                stderr=errors,
-                timeout=180,
-                check=False,
-            )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"redis-benchmark exited {result.returncode}:\n"
-                f"stdout:\n{report_path.read_text(errors='replace')}\n"
-                f"stderr:\n{stderr_path.read_text(errors='replace')}"
-            )
-        ops_per_sec, p99_ms = require_clean_benchmark(report_path)
+        ops_per_sec, p99_ms = run_raw_set_client(server.port, workload)
 
     if server.copy_bytes is None:
         raise RuntimeError("memcpy counter did not report copy bytes")
